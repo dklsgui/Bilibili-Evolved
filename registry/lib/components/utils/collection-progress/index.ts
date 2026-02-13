@@ -5,6 +5,7 @@ import { urlChange } from '@/core/observer'
 import { getJsonWithCredentials } from '@/core/ajax'
 import { logError } from '@/core/utils/log'
 import { Toast } from '@/core/toast'
+import { getComponentSettings } from '@/core/settings'
 import desc from './index.md'
 
 // 合集进度跟踪组件
@@ -16,14 +17,14 @@ import desc from './index.md'
 type CollectionId = string
 
 interface RecordLast {
-  aid: string
+  aid?: string
   bvid?: string
-  cid: number
+  cid?: number
   videoTitle?: string
   page?: number
-  positionSec: number
+  positionSec?: number
   durationSec?: number
-  updatedAt: string
+  updatedAt?: string
   playFinished?: boolean
 }
 interface RecordItem {
@@ -33,6 +34,7 @@ interface RecordItem {
   next?: { aid?: string; bvid?: string; cid?: number; page?: number }
   meta?: { up_uid?: number; up_name?: string }
   collectionType?: CollectionType
+  lastWatchTime?: number
 }
 interface StoreShape {
   version: number
@@ -82,7 +84,8 @@ const upsertCollection = (item: RecordItem) => {
   const store = readStore()
   const idx = store.collections.findIndex(it => it.id === item.id)
   if (idx >= 0) {
-    store.collections[idx] = { ...store.collections[idx], ...item }
+    const oldLast = { ...store.collections[idx].last, ...item.last }
+    store.collections[idx] = { ...store.collections[idx], ...item, last: oldLast }
   } else {
     store.collections.push(item)
   }
@@ -148,13 +151,14 @@ const secondsFromPlayer = async (): Promise<number> => {
   return 0
 }
 
-// 将播放器定位到指定秒数
+// 将播放器移动到不小于指定秒数的位置
 const seekPlayer = async (seconds: number) => {
   const { playerAgent } = await import('@/components/video/player-agent')
   const video = await playerAgent.query.video.element()
   if (video instanceof HTMLVideoElement) {
     try {
-      video.currentTime = Math.max(0, seconds)
+      // video.currentTime = Math.max(0, seconds)
+      video.currentTime = Math.max(0, seconds, video.currentTime)
     } catch (e) {
       logError(e)
     }
@@ -176,17 +180,7 @@ const timeupdateTracker = (() => {
   let elRef: HTMLVideoElement | null = null
   let timeupdateHandlerRef: (this: HTMLVideoElement, ev: Event) => any
   let endedHandlerRef: (this: HTMLVideoElement, ev: Event) => any
-  const handler = async (
-    collectionId: CollectionId,
-    current: {
-      aid: string
-      bvid: string
-      cid: number
-      videoTitle: string
-      page?: number
-      durationSec?: number
-    },
-  ) => {
+  const handler = async (collectionId: CollectionId) => {
     const now = Date.now()
     if (now - lastWrite < writeInterval * 1000) {
       return
@@ -196,30 +190,12 @@ const timeupdateTracker = (() => {
     upsertCollection({
       id: collectionId,
       last: {
-        aid: current.aid,
-        bvid: current.bvid,
-        cid: current.cid,
-        videoTitle: current.videoTitle,
-        page: current.page,
         positionSec: sec(positionSec),
-        durationSec: current.durationSec || 0,
-        updatedAt: nowIso(),
-        playFinished: getCollection(collectionId)?.last?.playFinished || false,
       },
     })
   }
   return {
-    async attach(
-      collectionId: CollectionId,
-      current: {
-        aid: string
-        bvid: string
-        cid: number
-        videoTitle: string
-        page?: number
-        durationSec?: number
-      },
-    ) {
+    async attach(collectionId: CollectionId) {
       if (installed) {
         return
       }
@@ -230,18 +206,11 @@ const timeupdateTracker = (() => {
       }
       installed = true
       elRef = el
-      timeupdateHandlerRef = () => handler(collectionId, current)
+      timeupdateHandlerRef = () => handler(collectionId)
       endedHandlerRef = () => {
         upsertCollection({
           id: collectionId,
           last: {
-            aid: current.aid,
-            bvid: current.bvid,
-            cid: current.cid,
-            page: current.page,
-            positionSec: 0,
-            durationSec: current.durationSec || 0,
-            updatedAt: nowIso(),
             playFinished: true,
           },
         })
@@ -371,6 +340,54 @@ const removeTrackControlItem = () => {
   el?.remove()
 }
 
+// 当跟踪合集数量超过阈值时，弹出清理窗口供用户选择删除
+const checkTrackedLimitAndPrompt = async () => {
+  try {
+    const {
+      options: { maxTracked },
+    } = getComponentSettings<{ maxTracked: number }>('collectionProgress')
+    const store = readStore()
+    if (store.collections.length >= maxTracked) {
+      const { showDialog } = await import('@/core/dialog')
+      showDialog({
+        title: '跟踪合集数量过多需清理',
+        content: () => import('./TrackedCleanup.vue'),
+        contentProps: {
+          items: store.collections.map(it => ({
+            id: it.id,
+            title: it.title || it.last?.videoTitle || `${it.last?.aid || ''}`,
+            jumpLink:
+              it.collectionType === CollectionType.Season
+                ? `https://www.bilibili.com/video/${it.last.bvid}`
+                : `https://www.bilibili.com/video/${it.last.bvid}?p=${it.last.page}`,
+          })),
+          onRemove: (id: string) => removeCollection(id),
+        },
+      })
+    }
+  } catch (e) {
+    logError(e)
+  }
+}
+
+// 添加前校验阈值，超限则弹窗并阻止继续添加
+const ensureTrackedLimitOk = async (): Promise<boolean> => {
+  try {
+    const {
+      options: { maxTracked },
+    } = getComponentSettings<{ maxTracked: number }>('collectionProgress')
+    const store = readStore()
+    await checkTrackedLimitAndPrompt()
+    if (store.collections.length >= maxTracked) {
+      return false
+    }
+    return true
+  } catch (e) {
+    logError(e)
+    return false
+  }
+}
+
 // 组件入口：注册控制栏按钮，监听URL与视频切换事件
 const entry = async () => {
   const tempData = await fetchView(unsafeWindow.aid, unsafeWindow.bvid, unsafeWindow.cid)
@@ -423,6 +440,10 @@ const entry = async () => {
           setTimeout(() => (dialog.open = true))
           return
         }
+        const allowAdd = await ensureTrackedLimitOk()
+        if (!allowAdd) {
+          return
+        }
         upsertCollection({
           id,
           title,
@@ -439,16 +460,17 @@ const entry = async () => {
           },
           meta: { up_uid: lodash.get(owner, 'mid'), up_name: lodash.get(owner, 'name') },
           collectionType: getCollectionType(data),
+          lastWatchTime: new Date().getTime(),
         })
         trackButton.displayName = '取消跟踪合集'
         trackButton.icon = 'mdi-bookmark-off'
+        timeupdateTracker.attach(id)
         Toast.success('已开始跟踪该合集', '合集进度跟踪', 2000)
       } catch (e) {
         Toast.error(`开启失败: ${e.message}`, '合集进度跟踪', 3000)
       }
     },
   }
-  addControlBarButton(trackButton)
 
   // 进入或切换页面时：提示是否跳转，并更新按钮状态
   urlChange(async () => {
@@ -466,6 +488,7 @@ const entry = async () => {
       if (!id) {
         return
       }
+      addControlBarButton(trackButton)
       const tracked = Boolean(getCollection(id))
       trackButton.displayName = tracked ? '取消跟踪合集' : '跟踪合集'
       trackButton.icon = tracked ? 'mdi-bookmark-off' : 'mdi-bookmark'
@@ -484,7 +507,7 @@ const entry = async () => {
       }
       const record = getCollection(id)
       if (!record?.last) {
-        timeupdateTracker.attach(id, { aid, bvid, cid: Number(dcid), videoTitle, page })
+        timeupdateTracker.attach(id)
         return
       }
       const { last } = record
@@ -513,10 +536,11 @@ const entry = async () => {
             updatedAt: nowIso(),
             playFinished: false,
           },
+          lastWatchTime: new Date().getTime(),
         })
         promptRef?.$el?.remove?.()
         promptRef?.$destroy?.()
-        timeupdateTracker.attach(id, { aid, bvid, cid: Number(dcid), videoTitle, page })
+        timeupdateTracker.attach(id)
       }
       if (!isJumpWrap(record.collectionType, last, current, data)) {
         promptRef = await renderPrompt(
@@ -536,21 +560,16 @@ const entry = async () => {
             cid: dcid,
             videoTitle,
             page,
-            positionSec: last.positionSec || 0,
+            positionSec:
+              last.playFinished || last.positionSec === last.durationSec ? 0 : last.positionSec,
             durationSec: current.durationSec,
             updatedAt: nowIso(),
             playFinished: false,
           },
+          lastWatchTime: new Date().getTime(),
         })
         seekPlayer(last.positionSec || 0)
-        timeupdateTracker.attach(id, {
-          aid,
-          bvid,
-          cid: Number(dcid),
-          videoTitle,
-          page,
-          durationSec: current.durationSec,
-        })
+        timeupdateTracker.attach(id)
       }
     } catch (e) {
       logError(e)
@@ -562,8 +581,21 @@ export const component = defineComponentMetadata({
   name: 'collectionProgress',
   displayName: '合集进度跟踪',
   author: { name: 'dklsgui', link: 'https://github.com/dklsgui' },
-  tags: [componentsTags.video],
+  tags: [componentsTags.utils, componentsTags.video],
   description: { 'zh-CN': desc },
   urlInclude: playerUrls,
+  options: {
+    maxTracked: {
+      defaultValue: 500,
+      displayName: '最大跟踪合集数量',
+      validator: (value: number, oldValue: number) => {
+        const n = Math.round(Number(value))
+        if (!Number.isFinite(n) || n < 1 || n > 1000 || readStore().collections.length > n) {
+          return oldValue
+        }
+        return n
+      },
+    },
+  },
   entry,
 })
