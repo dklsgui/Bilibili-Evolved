@@ -3,7 +3,9 @@
     <div class="list">
       <div v-for="it in list" :key="it.id" class="row">
         <div class="text">
-          <a :href="it.jumpLink" target="_blank" class="jump">{{ it.title }}</a>
+          <a :href="it.jumpLink" target="_blank" rel="noopener noreferrer" class="jump">
+            {{ it.title }}
+          </a>
         </div>
         <button class="danger" @click="remove(it.id)">删除</button>
       </div>
